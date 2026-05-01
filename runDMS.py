@@ -12,13 +12,13 @@ from sklearn.decomposition import FastICA
 # Modifica questi valori per calibrare la sensibilità del sistema
 
 # Soglie per il rilevamento del volto e degli occhi
-EAR_THRESHOLD = 0.22           # Soglia per considerare l'occhio chiuso (tipicamente 0.20 - 0.25)
+EAR_THRESHOLD = 0.18           # Soglia per considerare l'occhio chiuso (tipicamente 0.20 - 0.25)
 HEAD_POSE_THRESHOLD = 20.0     # Gradi massimi di pitch/yaw prima di considerare il conducente distratto
 
 # Timer Sonno / Microsonno (in secondi)
 TIMER_MICROSLEEP = 4.0         # Tempo di occhi chiusi per far scattare il "Microsonno"
 TIMER_SLEEP = 7.0              # Tempo di occhi chiusi per far scattare il "Sonno"
-TIMER_RESET_EYES = 1.0         # Tempo di occhi aperti consecutivo per resettare l'allarme sonno
+TIMER_RESET_EYES = 0.5         # Tempo di occhi aperti consecutivo per resettare l'allarme sonno
 
 # Timer Distrazione "Gufo" (in secondi)
 TIMER_LONG_OWL = 5.0               # Tempo di distrazione continua per allarme "Distracted (long)"
@@ -213,136 +213,151 @@ def main():
     sleep_active = False
 
     last_time = time.time()
+    
+    print("\nSistema di monitoraggio avviato in modo sicuro.")
+    print(" -> Premi 'q' sulla finestra del video per uscire.")
+    print(" -> Premi CTRL+C sul terminale per interrompere.\n")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
 
-        current_time = time.time()
-        delta_t = current_time - last_time
-        last_time = current_time
-        img_h, img_w, _ = frame.shape
+            current_time = time.time()
+            delta_t = current_time - last_time
+            last_time = current_time
+            img_h, img_w, _ = frame.shape
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Converte l'immagine per le nuove API di mediapipe
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        timestamp_ms = int(current_time * 1000)
-        face_landmarker_result = landmarker.detect_for_video(mp_image, timestamp_ms)
-
-        if face_landmarker_result.face_landmarks:
-            for face_landmarks in face_landmarker_result.face_landmarks:
-                # 1. Controllo Distrazione Gufo (Usa la variabile globale HEAD_POSE_THRESHOLD)
-                pitch, yaw, roll = get_head_pose(face_landmarks, img_w, img_h)
-                if abs(yaw) > HEAD_POSE_THRESHOLD or abs(pitch) > HEAD_POSE_THRESHOLD:
-                    is_looking_away = True
-                else:
-                    is_looking_away = False
-                    
-                # 2. Controllo Occhi Chiusi (EAR) -- Usa la variabile globale EAR_THRESHOLD
-                ear = get_ear(face_landmarks, img_w, img_h)
-                if ear < EAR_THRESHOLD:
-                    eyes_closed = True
-                else:
-                    eyes_closed = False
-        else:
-            is_looking_away = True
-            eyes_closed = False  # Se non c'è volto non allarmiamo sleep, ma assenza.
-
-        # --- TICKER OCCHI (Microsleep / Sleep) ---
-        if eyes_closed:
-            if eyes_closed_start_time is None:
-                eyes_closed_start_time = current_time
-            eyes_open_start_time = None
-        else:
-            if eyes_open_start_time is None:
-                eyes_open_start_time = current_time
-            eyes_closed_start_time = None
-
-        # v. Microsonno / vi. Sonno (Usando le variabili)
-        if eyes_closed_start_time is not None:
-            closed_duration = current_time - eyes_closed_start_time
-            if closed_duration >= TIMER_SLEEP:
-                sleep_active = True
-                microsleep_active = False # Promosso a sleep
-            elif closed_duration >= TIMER_MICROSLEEP and not sleep_active:
-                microsleep_active = True
-
-        # Disattivazione Sonno/Microsonno (Usando la variabile)
-        if (microsleep_active or sleep_active) and not eyes_closed and eyes_open_start_time is not None:
-            if (current_time - eyes_open_start_time) >= TIMER_RESET_EYES:
-                microsleep_active = False
-                sleep_active = False
-
-        # --- TICKER GUFO (Long / Short Distraction) ---
-        if is_looking_away:
-            if away_start_time is None:
-                away_start_time = current_time
-            focus_start_time_owl = None
-        else:
-            if focus_start_time_owl is None:
-                focus_start_time_owl = current_time
-            away_start_time = None
-
-        history.append((current_time, delta_t, is_looking_away))
-        
-        # Usa TIMER_SHORT_OWL_WINDOW
-        while history and history[0][0] < current_time - TIMER_SHORT_OWL_WINDOW:
-            history.popleft()
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-        cumulative_away_time = sum(h[1] for h in history if h[2])
+            # Converte l'immagine per le nuove API di mediapipe
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            timestamp_ms = int(current_time * 1000)
+            face_landmarker_result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        # Long Owl
-        if away_start_time is not None and (current_time - away_start_time) >= TIMER_LONG_OWL:
-            long_owl_active = True
-        if not is_looking_away:
-            long_owl_active = False
-
-        # Short Owl
-        if cumulative_away_time >= TIMER_SHORT_OWL_CUMULATIVE:
-            short_owl_active = True
-            
-        # Disattivazione Distrazione
-        if short_owl_active and not is_looking_away and focus_start_time_owl is not None:
-            if (current_time - focus_start_time_owl) >= TIMER_RESET_OWL:
-                short_owl_active = False
-                history.clear()
-
-        # --- PRIORITA' OUTPUT VISUALE ---
-        # e. Possibili stati del conducente, secondo la priorità d'emergenza
-        status_text = "Focused on the road"
-        status_color = (0, 255, 0)
-
-        if sleep_active:
-            status_text = "Sleep"
-            status_color = (0, 0, 255) # Rosso estremo
-        elif microsleep_active:
-            status_text = "Microsleep"
-            status_color = (255, 0, 255) # Magenta
-        elif long_owl_active:
-            status_text = "Distracted (long)"
-            status_color = (0, 165, 255) # Arancione scuro
-        elif short_owl_active:
-            status_text = "Distracted (short)"
-            status_color = (0, 255, 255) # Giallo
-
-        # d., e. L'output deve essere un video del volto con angoli in basso
-        cv2.putText(frame, f"Status: {status_text}", (img_w - 350, img_h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            if face_landmarker_result.face_landmarks:
+                for face_landmarks in face_landmarker_result.face_landmarks:
+                    # 1. Controllo Distrazione Gufo
+                    pitch, yaw, roll = get_head_pose(face_landmarks, img_w, img_h)
+                    if abs(yaw) > HEAD_POSE_THRESHOLD or abs(pitch) > HEAD_POSE_THRESHOLD:
+                        is_looking_away = True
+                    else:
+                        is_looking_away = False
+                        
+                    # 2. Controllo Occhi Chiusi (EAR) 
+                    ear = get_ear(face_landmarks, img_w, img_h)
                     
-        # f. Testo in basso a sinistra con il battito cardiaco in BPM
-        cv2.putText(frame, "Heart Rate: -- BPM", (20, img_h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                    # Stampa sulla console per farti calibrare l'EAR
+                    print(f"EAR Attuale: {ear:.3f} | Soglia: {EAR_THRESHOLD} | Stato: {'CHIUSI' if ear < EAR_THRESHOLD else 'APERTI'}", end="\r")
 
-        cv2.imshow("DMS - Driver Monitoring System", frame)
+                    if ear < EAR_THRESHOLD:
+                        eyes_closed = True
+                    else:
+                        eyes_closed = False
+            else:
+                is_looking_away = True
+                eyes_closed = False  # Se non c'è volto non allarmiamo sleep, ma assenza.
 
-        # Interrompi con 'q'
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            # --- TICKER OCCHI (Microsleep / Sleep) ---
+            if eyes_closed:
+                if eyes_closed_start_time is None:
+                    eyes_closed_start_time = current_time
+                eyes_open_start_time = None
+            else:
+                if eyes_open_start_time is None:
+                    eyes_open_start_time = current_time
+                eyes_closed_start_time = None
 
-    cap.release()
-    cv2.destroyAllWindows()
+            # v. Microsonno / vi. Sonno 
+            if eyes_closed_start_time is not None:
+                closed_duration = current_time - eyes_closed_start_time
+                if closed_duration >= TIMER_SLEEP:
+                    sleep_active = True
+                    microsleep_active = False # Promosso a sleep
+                elif closed_duration >= TIMER_MICROSLEEP and not sleep_active:
+                    microsleep_active = True
+
+            # Disattivazione Sonno/Microsonno 
+            if (microsleep_active or sleep_active) and not eyes_closed and eyes_open_start_time is not None:
+                if (current_time - eyes_open_start_time) >= TIMER_RESET_EYES:
+                    microsleep_active = False
+                    sleep_active = False
+
+            # --- TICKER GUFO (Long / Short Distraction) ---
+            if is_looking_away:
+                if away_start_time is None:
+                    away_start_time = current_time
+                focus_start_time_owl = None
+            else:
+                if focus_start_time_owl is None:
+                    focus_start_time_owl = current_time
+                away_start_time = None
+
+            history.append((current_time, delta_t, is_looking_away))
+            
+            while history and history[0][0] < current_time - TIMER_SHORT_OWL_WINDOW:
+                history.popleft()
+                
+            cumulative_away_time = sum(h[1] for h in history if h[2])
+
+            # Long Owl
+            if away_start_time is not None and (current_time - away_start_time) >= TIMER_LONG_OWL:
+                long_owl_active = True
+            if not is_looking_away:
+                long_owl_active = False
+
+            # Short Owl
+            if cumulative_away_time >= TIMER_SHORT_OWL_CUMULATIVE:
+                short_owl_active = True
+                
+            # Disattivazione Distrazione
+            if short_owl_active and not is_looking_away and focus_start_time_owl is not None:
+                if (current_time - focus_start_time_owl) >= TIMER_RESET_OWL:
+                    short_owl_active = False
+                    history.clear()
+
+            # --- PRIORITA' OUTPUT VISUALE ---
+            status_text = "Focused on the road"
+            status_color = (0, 255, 0)
+
+            if sleep_active:
+                status_text = "Sleep"
+                status_color = (0, 0, 255) # Rosso estremo
+            elif microsleep_active:
+                status_text = "Microsleep"
+                status_color = (255, 0, 255) # Magenta
+            elif long_owl_active:
+                status_text = "Distracted (long)"
+                status_color = (0, 165, 255) # Arancione scuro
+            elif short_owl_active:
+                status_text = "Distracted (short)"
+                status_color = (0, 255, 255) # Giallo
+
+            cv2.putText(frame, f"Status: {status_text}", (img_w - 350, img_h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+                        
+            cv2.putText(frame, "Heart Rate: -- BPM", (20, img_h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+            cv2.imshow("DMS - Driver Monitoring System", frame)
+
+            # Interrompi con 'q'
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("\n\nUscita manuale richiesta (tasto 'q').")
+                break
+
+    except KeyboardInterrupt:
+        # Questa sezione scatta solo se premi CTRL+C nel terminale
+        print("\n\nInterruzione forzata rilevata (CTRL+C).")
+        
+    finally:
+        # Questa sezione viene eseguita SEMPRE alla fine, spegnendo la telecamera pulitamente
+        print("Spegnimento della videocamera e pulizia delle finestre...")
+        if cap.isOpened():
+            cap.release()
+        cv2.destroyAllWindows()
+        print("Chiusura completata con successo. A presto!")
 
 if __name__ == "__main__":
     main()
