@@ -9,26 +9,31 @@ from scipy.signal import butter, filtfilt
 from sklearn.decomposition import FastICA
 
 # --- CONFIGURAZIONE TIMER E SOGLIE ---
-# Modifica questi valori per calibrare la sensibilità del sistema
 
-# Soglie per il rilevamento del volto e degli occhi
-EAR_THRESHOLD = 0.18           # Soglia per considerare l'occhio chiuso (tipicamente 0.20 - 0.25)
-HEAD_POSE_THRESHOLD = 20.0     # Gradi massimi di pitch/yaw prima di considerare il conducente distratto
+# Soglie TESTA (Distrazione)
+YAW_BASELINE = 18.5            # Il tuo "Zero" per la rotazione dx/sx
+PITCH_BASELINE = 175.0         # Il tuo "Zero" per la rotazione su/giù
 
-# Timer Sonno / Microsonno (in secondi)
-TIMER_MICROSLEEP = 4.0         # Tempo di occhi chiusi per far scattare il "Microsonno"
-TIMER_SLEEP = 7.0              # Tempo di occhi chiusi per far scattare il "Sonno"
-TIMER_RESET_EYES = 0.5         # Tempo di occhi aperti consecutivo per resettare l'allarme sonno
+YAW_THRESHOLD = 15.0           # Gradi di tolleranza dal punto zero (Dx/Sx)
+PITCH_THRESHOLD = 12.0         # Gradi di tolleranza dal punto zero (Su/Giù)
 
-# Timer Distrazione "Gufo" (in secondi)
-TIMER_LONG_OWL = 5.0               # Tempo di distrazione continua per allarme "Distracted (long)"
-TIMER_SHORT_OWL_CUMULATIVE = 10.0  # Tempo cumulativo di distrazione per allarme "Distracted (short)"...
-TIMER_SHORT_OWL_WINDOW = 30.0      # ...calcolato all'interno di questa finestra temporale
-TIMER_RESET_OWL = 2.0              # Tempo di attenzione continua per resettare l'allarme distrazione
+# Soglie OCCHI
+EAR_THRESHOLD = 0.18           
+TIMER_MICROSLEEP = 4.0         
+TIMER_SLEEP = 7.0              
+TIMER_RESET_EYES = 2.0         # Prof req: mantenuti aperti per almeno 2s (regole v e vi)
+
+# Soglie TESTA (Distrazione)
+TIMER_LONG_OWL = 5.0               
+TIMER_SHORT_OWL_CUMULATIVE = 10.0  # Prof req: 10s
+TIMER_SHORT_OWL_WINDOW = 30.0      # Prof req: in una finestra di 30s
+TIMER_RESET_OWL = 0.5          # Tempo di sguardo dritto necessario per spezzare la distrazione continua
+
+# Tolleranza BPM
+MAX_BPM_VARIATION = 20.0       # Variazione massima accettata rispetto alla media attuale (in BPM)
 # -------------------------------------
 
 def download_model_if_needed():
-    """Scarica il modello visivo di MediaPipe se non è presente localmente."""
     model_path = "face_landmarker.task"
     if not os.path.exists(model_path):
         print(f"Modello MediaPipe '{model_path}' non trovato.")
@@ -38,14 +43,13 @@ def download_model_if_needed():
         print("Download completato con successo!")
 
 def get_head_pose(face_landmarks, img_w, img_h):
-    """ Calcola l'orientamento della testa (pitch, yaw, roll) """
     face3d = np.array([
-        (0.0, 0.0, 0.0),            # Punta del naso (1)
-        (0.0, -330.0, -65.0),       # Mento (152)
-        (-225.0, 170.0, -135.0),    # Angolo occhio sx (33)
-        (225.0, 170.0, -135.0),     # Angolo occhio dx (263)
-        (-150.0, -150.0, -125.0),   # Angolo bocca sx (61)
-        (150.0, -150.0, -125.0)     # Angolo bocca dx (291)
+        (0.0, 0.0, 0.0),            
+        (0.0, -330.0, -65.0),       
+        (-225.0, 170.0, -135.0),    
+        (225.0, 170.0, -135.0),     
+        (-150.0, -150.0, -125.0),   
+        (150.0, -150.0, -125.0)     
     ], dtype=np.float64)
 
     face2d = np.array([
@@ -65,15 +69,12 @@ def get_head_pose(face_landmarks, img_w, img_h):
 
     success, rot_vec, trans_vec = cv2.solvePnP(face3d, face2d, cam_matrix, dist_coeffs)
     rmat, _ = cv2.Rodrigues(rot_vec)
-    angles, _, _, _, _, _, _ = cv2.decomposeProjectionMatrix(np.hstack((rmat, trans_vec)))
+    _, _, _, _, _, _, eulerAngles = cv2.decomposeProjectionMatrix(np.hstack((rmat, trans_vec)))
+    pitch, yaw, roll = eulerAngles[0][0], eulerAngles[1][0], eulerAngles[2][0]
 
-    pitch, yaw, roll = angles[0][0], angles[1][0], angles[2][0]
     return pitch, yaw, roll
 
 def get_ear(face_landmarks, img_w, img_h):
-    """
-    Calcola l'Eye Aspect Ratio (EAR) usando le posizioni delle palpebre.
-    """
     def dist(p1_idx, p2_idx):
         x1, y1 = face_landmarks[p1_idx].x * img_w, face_landmarks[p1_idx].y * img_h
         x2, y2 = face_landmarks[p2_idx].x * img_w, face_landmarks[p2_idx].y * img_h
@@ -93,18 +94,15 @@ class HeartRateEstimator:
         self.ica = FastICA(n_components=3, random_state=0)
         
     def add_frame(self, image, face_landmarks, current_time, img_w, img_h):
-        # Punto 10: centro fronte (superiore al naso) come Region Of Interest (ROI)
         x = int(face_landmarks[10].x * img_w)
         y = int(face_landmarks[10].y * img_h)
-        
-        # Estrarre un piccolo quadrato di pixel 20x20 per la ROI (sulla fronte)
         box_size = 10
         y1, y2 = max(0, y - box_size), min(img_h, y + box_size)
         x1, x2 = max(0, x - box_size), min(img_w, x + box_size)
         
         if y2 > y1 and x2 > x1:
             roi = image[y1:y2, x1:x2]
-            avg_color = np.mean(roi, axis=(0, 1)) # BGR
+            avg_color = np.mean(roi, axis=(0, 1)) 
             self.rgb_signals.append(avg_color)
             self.times.append(current_time)
             
@@ -114,25 +112,20 @@ class HeartRateEstimator:
 
     def estimate_bpm(self):
         if len(self.rgb_signals) < self.buffer_size:
-            return None # Non abbiamo accumulato abbastanza dati
+            return None 
 
-        # Calcolo dell'effettivo FPS in base al tempo reale
         time_diff = self.times[-1] - self.times[0]
         if time_diff == 0: return None
         actual_fps = len(self.times) / time_diff
 
-        signals = np.array(self.rgb_signals) # shape: (N, 3)
-        
-        # Normalizzazione del segnale
+        signals = np.array(self.rgb_signals) 
         signals = (signals - np.mean(signals, axis=0)) / np.std(signals, axis=0)
 
-        # Applica FastICA (Implementazione Python equivalente al codice MATLAB del prof)
         try:
             source_signals = self.ica.fit_transform(signals)
         except:
             return None
 
-        # Filtro passa-banda Butterworth per i battiti divini (0.75 Hz = 45 BPM, 3.0 Hz = 180 BPM)
         nyquist = 0.5 * actual_fps
         low = 0.75 / nyquist
         high = 3.0 / nyquist
@@ -144,19 +137,14 @@ class HeartRateEstimator:
         max_power = 0
         best_bpm = 0
         
-        # Processa ciascuna delle 3 componenti indipendenti estratte dall'ICA
         for i in range(source_signals.shape[1]):
             comp = source_signals[:, i]
-            # Filtra la componente
             filtered = filtfilt(b, a, comp)
             
-            # Trasformata di Fourier per trovare la frequenza dominante
             fft_data = np.fft.rfft(filtered)
             fft_freq = np.fft.rfftfreq(len(filtered), 1.0 / actual_fps)
-            
             power = np.abs(fft_data)
             
-            # Cerca il picco massimo nel range 0.75-3.0 Hz (45-180 BPM)
             valid_idx = np.where((fft_freq >= 0.75) & (fft_freq <= 3.0))
             if len(valid_idx[0]) > 0:
                 peak_idx = valid_idx[0][np.argmax(power[valid_idx])]
@@ -165,39 +153,29 @@ class HeartRateEstimator:
                 
                 if peak_power > max_power:
                     max_power = peak_power
-                    best_bpm = peak_freq * 60.0 # hz to bpm
+                    best_bpm = peak_freq * 60.0
                     
         return int(best_bpm) if best_bpm > 0 else None
 
 def main():
-    # Controlla e scarica il file .task se mancante, in modo da poter consegnare solo questo .py
     download_model_if_needed()
 
-    print("Inizializzazione DMS (Driver Monitoring System)...")
-    print("Premi 'q' per uscire.")
-    
-    # Inizializza MediaPipe FaceLandmarker con le nuove API Data/Tasks (Compatibile con Python 3.13)
     BaseOptions = mp.tasks.BaseOptions
     FaceLandmarker = mp.tasks.vision.FaceLandmarker
     FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
     VisionRunningMode = mp.tasks.vision.RunningMode
 
-    # Usa il modello scaricato localmente
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path='face_landmarker.task'),
         running_mode=VisionRunningMode.VIDEO)
     
-    # Inizializzazione della videocamera con landmarker
     landmarker = FaceLandmarker.create_from_options(options)
-
-    # Inizializza la webcam
     cap = cv2.VideoCapture(0)
     
     if not cap.isOpened():
         print("Errore: impossibile accedere alla telecamera.")
         return
 
-    # Tracking Gufo (Distrazione Posizione Testa)
     is_looking_away = False
     away_start_time = None
     focus_start_time_owl = None
@@ -205,7 +183,6 @@ def main():
     short_owl_active = False
     history = deque()
     
-    # Tracking Occhi (Sleep / Microsleep)
     eyes_closed = False
     eyes_closed_start_time = None
     eyes_open_start_time = None
@@ -213,6 +190,16 @@ def main():
     sleep_active = False
 
     last_time = time.time()
+    ear = yaw = pitch = 0.0 
+    cumulative_away_time = 0.0
+    
+    # --- STIMATORE BATTITO CARDIACO ---
+    hr_estimator = HeartRateEstimator(buffer_size=150)
+    current_bpm = None
+    last_bpm_calc_time = time.time()
+    
+    # Memoria circolare per gli ultimi 5 valori VALIDI di BPM
+    bpm_history = deque(maxlen=5)
     
     print("\nSistema di monitoraggio avviato in modo sicuro.")
     print(" -> Premi 'q' sulla finestra del video per uscire.")
@@ -230,34 +217,37 @@ def main():
             img_h, img_w, _ = frame.shape
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Converte l'immagine per le nuove API di mediapipe
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
             timestamp_ms = int(current_time * 1000)
             face_landmarker_result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             if face_landmarker_result.face_landmarks:
                 for face_landmarks in face_landmarker_result.face_landmarks:
-                    # 1. Controllo Distrazione Gufo
+                    # Rilevamento dati Greci (Angoli e EAR)
                     pitch, yaw, roll = get_head_pose(face_landmarks, img_w, img_h)
-                    if abs(yaw) > HEAD_POSE_THRESHOLD or abs(pitch) > HEAD_POSE_THRESHOLD:
+                    ear = get_ear(face_landmarks, img_w, img_h)
+                    
+                    # Calcoliamo di quanti gradi ti sei mosso rispetto al TUO punto zero
+                    diff_yaw = min(abs(yaw - YAW_BASELINE), 360 - abs(yaw - YAW_BASELINE))
+                    diff_pitch = min(abs(pitch - PITCH_BASELINE), 360 - abs(pitch - PITCH_BASELINE))
+
+                    # Se la differenza supera la tolleranza, sei distratto
+                    if diff_yaw > YAW_THRESHOLD or diff_pitch > PITCH_THRESHOLD:
                         is_looking_away = True
                     else:
                         is_looking_away = False
                         
-                    # 2. Controllo Occhi Chiusi (EAR) 
-                    ear = get_ear(face_landmarks, img_w, img_h)
-                    
-                    # Stampa sulla console per farti calibrare l'EAR
-                    print(f"EAR Attuale: {ear:.3f} | Soglia: {EAR_THRESHOLD} | Stato: {'CHIUSI' if ear < EAR_THRESHOLD else 'APERTI'}", end="\r")
-
+                    # Controllo Sonno
                     if ear < EAR_THRESHOLD:
                         eyes_closed = True
                     else:
                         eyes_closed = False
+                        
+                    # Inseriamo il frame corrente e i landmarks nello stimatore
+                    hr_estimator.add_frame(frame, face_landmarks, current_time, img_w, img_h)
             else:
                 is_looking_away = True
-                eyes_closed = False  # Se non c'è volto non allarmiamo sleep, ma assenza.
+                eyes_closed = False  
 
             # --- TICKER OCCHI (Microsleep / Sleep) ---
             if eyes_closed:
@@ -269,16 +259,14 @@ def main():
                     eyes_open_start_time = current_time
                 eyes_closed_start_time = None
 
-            # v. Microsonno / vi. Sonno 
             if eyes_closed_start_time is not None:
                 closed_duration = current_time - eyes_closed_start_time
                 if closed_duration >= TIMER_SLEEP:
                     sleep_active = True
-                    microsleep_active = False # Promosso a sleep
+                    microsleep_active = False 
                 elif closed_duration >= TIMER_MICROSLEEP and not sleep_active:
                     microsleep_active = True
 
-            # Disattivazione Sonno/Microsonno 
             if (microsleep_active or sleep_active) and not eyes_closed and eyes_open_start_time is not None:
                 if (current_time - eyes_open_start_time) >= TIMER_RESET_EYES:
                     microsleep_active = False
@@ -292,67 +280,106 @@ def main():
             else:
                 if focus_start_time_owl is None:
                     focus_start_time_owl = current_time
-                away_start_time = None
+                
+                # Resetta il contatore continuità solo se hai guardato dritto per TIMER_RESET_OWL
+                if (current_time - focus_start_time_owl) >= TIMER_RESET_OWL:
+                    away_start_time = None
+                    long_owl_active = False
 
+            # Gestione Storico (Finestra cumulativa 30s)
             history.append((current_time, delta_t, is_looking_away))
-            
             while history and history[0][0] < current_time - TIMER_SHORT_OWL_WINDOW:
                 history.popleft()
                 
             cumulative_away_time = sum(h[1] for h in history if h[2])
 
-            # Long Owl
+            # Attivazione Long Owl
             if away_start_time is not None and (current_time - away_start_time) >= TIMER_LONG_OWL:
                 long_owl_active = True
-            if not is_looking_away:
-                long_owl_active = False
 
-            # Short Owl
+            # Attivazione Short Owl (Cumulativa)
             if cumulative_away_time >= TIMER_SHORT_OWL_CUMULATIVE:
                 short_owl_active = True
                 
-            # Disattivazione Distrazione
+            # Disattivazione visiva dell'allarme Short Owl (serve guardare la strada per 2 secondi per spegnerlo e pulire la cronologia)
             if short_owl_active and not is_looking_away and focus_start_time_owl is not None:
-                if (current_time - focus_start_time_owl) >= TIMER_RESET_OWL:
+                if (current_time - focus_start_time_owl) >= 2.0:
                     short_owl_active = False
                     history.clear()
+                    
+            # --- CALCOLO BPM CON MEDIA MOBILE E RIFIUTO ANOMALIE ---
+            if current_time - last_bpm_calc_time > 1.0:
+                bpm_estimate = hr_estimator.estimate_bpm()
+                
+                if bpm_estimate is not None:
+                    # Validazione fisiologica di base
+                    if 45 <= bpm_estimate <= 180:
+                        
+                        if len(bpm_history) == 0:
+                            # Primo dato utile: lo accettiamo direttamente
+                            bpm_history.append(bpm_estimate)
+                            current_bpm = bpm_estimate
+                        else:
+                            # Calcoliamo la media attuale
+                            current_mean = np.mean(bpm_history)
+                            
+                            # Rifiutiamo anomalie: il nuovo dato deve essere entro la tolleranza
+                            if abs(bpm_estimate - current_mean) <= MAX_BPM_VARIATION:
+                                bpm_history.append(bpm_estimate)
+                                # Aggiorniamo il BPM da mostrare a schermo con la nuova media
+                                current_bpm = int(np.mean(bpm_history))
+                            else:
+                                print(f"-> Anomalia BPM ignorata: Stima={bpm_estimate}, Media attuale={current_mean:.1f}")
+                                
+                last_bpm_calc_time = current_time
 
-            # --- PRIORITA' OUTPUT VISUALE ---
-            status_text = "Focused on the road"
-            status_color = (0, 255, 0)
+            # --- DEBUG CONSOLE (Timer inclusi) ---
+            cont_distr_time = (current_time - away_start_time) if away_start_time is not None else 0.0
+            
+            occhi_str = "CHIUSI" if eyes_closed else "APERTI"
+            distr_str = "SI" if is_looking_away else "NO"
+            
+            print(f"EAR: {ear:.2f} | YAW: {yaw:>5.1f}° | Occhi: {occhi_str:<6} | Distr: {distr_str:<2} | Continuo (Long): {cont_distr_time:.1f}s/5s | Cumulativo (Short): {cumulative_away_time:.1f}s/10s")
 
+            # --- OUTPUT VISUALE UNIFICATO CON PRIORITÀ ---
             if sleep_active:
                 status_text = "Sleep"
-                status_color = (0, 0, 255) # Rosso estremo
+                status_color = (0, 0, 255) # Rosso BGR
             elif microsleep_active:
                 status_text = "Microsleep"
-                status_color = (255, 0, 255) # Magenta
+                status_color = (255, 0, 255) # Magenta BGR
             elif long_owl_active:
                 status_text = "Distracted (long)"
-                status_color = (0, 165, 255) # Arancione scuro
+                status_color = (0, 165, 255) # Arancione BGR
             elif short_owl_active:
                 status_text = "Distracted (short)"
-                status_color = (0, 255, 255) # Giallo
+                status_color = (0, 255, 255) # Giallo BGR
+            else:
+                status_text = "Focused on the road"
+                status_color = (0, 255, 0) # Verde BGR
 
-            cv2.putText(frame, f"Status: {status_text}", (img_w - 350, img_h - 20),
+            cv2.putText(frame, status_text, (img_w - 300, img_h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
                         
-            cv2.putText(frame, "Heart Rate: -- BPM", (20, img_h - 20),
+            # Stampa i BPM in basso a sinistra
+            if current_bpm is not None:
+                bpm_text = f"Heart Rate: {current_bpm} BPM"
+            else:
+                bpm_text = "Heart Rate: -- BPM (Calcolo...)"
+                
+            cv2.putText(frame, bpm_text, (20, img_h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
             cv2.imshow("DMS - Driver Monitoring System", frame)
 
-            # Interrompi con 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 print("\n\nUscita manuale richiesta (tasto 'q').")
                 break
 
     except KeyboardInterrupt:
-        # Questa sezione scatta solo se premi CTRL+C nel terminale
         print("\n\nInterruzione forzata rilevata (CTRL+C).")
         
     finally:
-        # Questa sezione viene eseguita SEMPRE alla fine, spegnendo la telecamera pulitamente
         print("Spegnimento della videocamera e pulizia delle finestre...")
         if cap.isOpened():
             cap.release()
