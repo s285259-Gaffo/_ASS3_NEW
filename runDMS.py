@@ -201,8 +201,9 @@ def main():
         return
 
     # Variabili Calibrazione
+    waiting_for_start = True
     is_calibrating = True
-    calibration_start_time = time.time()
+    calibration_start_time = None
     yaw_samples = []
     pitch_samples = []
     yaw_baseline = 0.0
@@ -243,7 +244,7 @@ def main():
     bpm_history = deque(maxlen=5)
     
     print("\nSistema di monitoraggio avviato in modo sicuro.")
-    print(" -> Inizia la fase di calibrazione. Guarda dritto verso lo schermo.")
+    print(" -> Premi SPAZIO sulla finestra video per avviare i 10s di calibrazione.")
     print(" -> Premi 'R' sulla finestra del video per ricalibrare.")
     print(" -> Premi 'q' sulla finestra del video per uscire.\n")
 
@@ -254,9 +255,40 @@ def main():
                 continue
 
             current_time = time.time()
+            img_h, img_w, _ = frame.shape
+
+            # --- SCHERMATA DI ATTESA INIZIALE ---
+            if waiting_for_start:
+                text1 = "Press SPACE to start 10s calibration"
+                text2 = "Keep your gaze fixed on the center of the screen"
+                
+                # Calcola la dimensione del testo per centrarlo
+                t_size1 = cv2.getTextSize(text1, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                t_size2 = cv2.getTextSize(text2, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                
+                t_x1 = (img_w - t_size1[0]) // 2
+                t_x2 = (img_w - t_size2[0]) // 2
+                
+                cv2.putText(frame, text1, (t_x1, img_h // 2 - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                cv2.putText(frame, text2, (t_x2, img_h // 2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                
+                cv2.imshow("DMS - Driver Monitoring System", frame)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord(' '):
+                    waiting_for_start = False
+                    calibration_start_time = time.time()
+                    last_time = time.time()
+                    last_bpm_calc_time = time.time()
+                    print("\n[!] Inizio calibrazione...")
+                
+                continue  # Salta il resto del ciclo finché non viene premuto spazio
+
+            # --- ESECUZIONE NORMALE ---
             delta_t = current_time - last_time
             last_time = current_time
-            img_h, img_w, _ = frame.shape
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
@@ -289,7 +321,7 @@ def main():
                             last_time = time.time()
                         
                         else:
-                            overlay_text = f"CALIBRAZIONE: Guarda dritto per {int(time_left)}s"
+                            overlay_text = f"CALIBRATION: Look straight for {int(time_left)}s"
                             cv2.putText(frame, overlay_text, (50, img_h // 2), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
                             
@@ -466,11 +498,12 @@ def main():
             if key == ord('q'):
                 break
             elif key == ord('r') or key == ord('R'):
+                # Torna alla schermata di attesa iniziale
+                waiting_for_start = True
                 is_calibrating = True
                 yaw_samples.clear()
                 pitch_samples.clear()
-                calibration_start_time = time.time()
-                print("\n[!] RICALIBRAZIONE FORZATA IN CORSO...\n")
+                print("\n[!] RICALIBRAZIONE RICHIESTA. Premi SPAZIO per avviare...\n")
 
     except KeyboardInterrupt:
         print("\n\nInterruzione forzata rilevata (CTRL+C).")
